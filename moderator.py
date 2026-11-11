@@ -13,6 +13,8 @@ import game_rules as g
 from cluedo_comm import CommServer
 
 DEFAULT_SOCKET = "/tmp/cluedo/cluedo.sock"
+ASK_TIMEOUT = 30   # seconds a player has to answer a request (P1)
+MAX_MISSES = 3     # consecutive skipped turns before a silent player is dropped
 
 _rid = itertools.count(1)
 
@@ -48,8 +50,9 @@ def last_words():
 
 
 class Game:
-    def __init__(self, server, player_ids, seed=None):
+    def __init__(self, server, player_ids, seed=None, ask_timeout=ASK_TIMEOUT):
         self.srv = server
+        self.ask_timeout = ask_timeout
         self.ids = player_ids
         self.names = {pid: server.name(pid) for pid in player_ids}
 
@@ -58,16 +61,34 @@ class Game:
         place_rng = random.Random(None if seed is None else seed * 7919 + 1)
         self.pos = {pid: place_rng.choice(g.ROOMS) for pid in player_ids}
         self.alive = {pid: True for pid in player_ids}
+        self.misses = {pid: 0 for pid in player_ids}   # consecutive skipped turns
         self.winner = None
 
     async def info(self, text, exclude=()):
         print(text, flush=True)
         await self.srv.broadcast({"type": "info", "text": text}, exclude=exclude)
 
+    async def ask_raw(self, pid, kind, prompt, options=None, timeout=None):
+        """Send a request and return the reply that answers it (whole dict).
+        Returns None on timeout or disconnect. Replies with the wrong rid are
+        ignored, so a stray/unsolicited message can't be taken as the answer."""
+        r = rid()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + (self.ask_timeout if timeout is None else timeout)
+        await self.srv.send(pid, {"type": "request", "rid": r, "kind": kind,
+                                  "prompt": prompt, "options": options})
+        while True:
+            left = deadline - loop.time()
+            if left <= 0:
+                return None
+            reply = await self.srv.recv(pid, timeout=left)
+            if reply is None:            # timed out, or the player disconnected
+                return None
+            if reply.get("rid") == r:
+                return reply
+
     async def ask(self, pid, kind, prompt, options=None, timeout=None):
-        reply = await self.srv.request(
-            pid, {"type": "request", "rid": rid(), "kind": kind,
-                  "prompt": prompt, "options": options}, timeout=timeout)
+        reply = await self.ask_raw(pid, kind, prompt, options, timeout)
         return None if reply is None else reply.get("value")
 
     async def ask_yesno(self, pid, prompt):
@@ -109,11 +130,29 @@ class Game:
         print(table, flush=True)
         await self.srv.broadcast({"type": "board", "table": table})
 
+    async def drop(self, pid, reason):
+        """Take a player out of the game for the rest of it (P2)."""
+        if not self.alive[pid]:
+            return
+        self.alive[pid] = False
+        await self.info("%s has left the game (%s)." % (self.names[pid], reason))
+        await self.broadcast_board()
+
     async def take_turn(self, pid):
         name = self.names[pid]
+        if not self.srv.is_connected(pid):
+            await self.drop(pid, "disconnected")
+            return
         await self.info("=== %s's turn ===" % name)
 
-        await self.ask(pid, "roll", "Press ENTER to roll the dice.")
+        if await self.ask_raw(pid, "roll", "Press ENTER to roll the dice.") is None:
+            self.misses[pid] += 1
+            if self.misses[pid] >= MAX_MISSES:
+                await self.drop(pid, "idle")   # silent too long: take them out (P1)
+            else:
+                await self.info("%s did not answer in time and loses this turn." % name)
+            return
+        self.misses[pid] = 0   # answered: reset the idle counter
         roll = random.randint(1, 6)
         await self.info("%s rolled a %d." % (name, roll))
 
@@ -162,7 +201,7 @@ class Game:
                               "Choose ONE to reveal privately to %s." % (name, name),
                     "options": sorted(guess & set(self.hand[p]))}
 
-        replies = await self.srv.gather(holders, make_req, timeout=120)
+        replies = await self.srv.gather(holders, make_req, timeout=self.ask_timeout)
         for holder in holders:
             reply = replies.get(holder)
             matches = sorted(guess & set(self.hand[holder]))
@@ -221,6 +260,8 @@ async def main():
     ap.add_argument("--allow-prefix", default=None,
                     help="only accept Linux users whose name starts with this")
     ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--ask-timeout", type=float, default=ASK_TIMEOUT,
+                    help="seconds a player has to answer a request")
     args = ap.parse_args()
 
     server = await CommServer.start(args.socket, group=args.group,
@@ -229,7 +270,7 @@ async def main():
     await server.wait_players(args.players)
 
     ids = server.player_ids()[: args.players]
-    game = Game(server, ids, seed=args.seed)
+    game = Game(server, ids, seed=args.seed, ask_timeout=args.ask_timeout)
     try:
         await game.play()
     finally:

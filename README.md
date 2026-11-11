@@ -18,7 +18,9 @@ No installation or compiling needed, just **Python 3.8+ on Linux**.
 | `game_rules.py` | Cards, board, dealing, movement (no networking). |
 | `bot.py` | An auto-player, used by `run_demo.sh`. |
 | `run_demo.sh` | Plays a full bot-only game (one command). |
-| `setup_users.sh` | Creates the `player1..N` Linux users. |
+| `setup_users.sh` | Creates the `player1..N` Linux users, installs to `/opt/clue-dos`. |
+| `launch_isolated.sh` | Starts a player inside a systemd cgroup with resource limits (Project 2/3). |
+| `attacks.py` | Misbehaving-player tool used to test the isolation and robustness fixes. |
 
 ## Communications library
 
@@ -63,6 +65,45 @@ sudo -u player3 python3 /opt/clue-dos/player.py --name Carol
 ```
 The game starts when the last player connects. Clean up later with
 `sudo ./setup_users.sh clean 3`.
+
+## Isolation and robustness (Project 2/3)
+
+The improvement for Project 2/3 is an **isolation mechanism plus robustness
+fixes** so that one misbehaving player can no longer stall or exhaust the
+moderator.
+
+**cgroup isolation (per player).** Instead of a plain `sudo -u`, launch each
+player inside a systemd transient cgroup with CPU, memory, and task limits:
+```bash
+sudo ./launch_isolated.sh 1 Alice      # MemoryMax=128M TasksMax=20 CPUQuota=20%
+# override: MEM=64M TASKS=10 CPU=10% sudo ./launch_isolated.sh 1 Alice
+```
+Confirm the limits applied (second terminal):
+```bash
+systemctl show cluedo-p1 -p MemoryMax -p TasksMax -p CPUQuotaPerSecUSec
+systemd-cgtop -n 1
+```
+A fork bomb, memory hog, or CPU burn inside a player's own process is then
+capped to that player's cgroup and cannot take down the VM or the game.
+
+**Library/moderator robustness.** The library now caps message size
+(`MAX_MSG`), bounds each player's inbox (`INBOX_MAX`, backpressure), and wakes a
+waiting `recv` when a player disconnects. The moderator gives every request a
+timeout (`--ask-timeout`, default 30 s), matches replies to requests by `rid`,
+and drops players who disconnect. Net effect: a silent player, a disconnect, an
+oversized length prefix, or a message flood no longer hangs or bloats the game.
+
+**Testing.** `attacks.py` drives each case:
+```bash
+# library/robustness tests (run as a player user, or your own user for a local test)
+python3 attacks.py silent     # join then never answer  -> turn is skipped
+python3 attacks.py quit       # join then disconnect     -> player dropped
+python3 attacks.py oversize   # 4 GB length prefix        -> rejected, memory flat
+python3 attacks.py flood      # 100k messages             -> bounded inbox, memory flat
+# cgroup tests (run the attacker through the launcher, on the VM)
+sudo ./launch_isolated.sh 1 Mallory   # then inside: run attacks.py fork / mem / cpu
+```
+Use `--ask-timeout 2` on the moderator to see the timeouts quickly.
 
 ## How to play
 

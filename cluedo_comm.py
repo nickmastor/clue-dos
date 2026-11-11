@@ -14,6 +14,12 @@ import socket
 import struct
 
 _LEN = struct.Struct(">I")
+MAX_MSG = 64 * 1024   # largest message body we accept from a client (P3)
+INBOX_MAX = 100       # messages buffered per player before we stop reading (P4)
+
+
+class MessageTooLarge(ValueError):
+    """A length prefix claimed more than MAX_MSG bytes."""
 
 
 async def send_msg(writer, obj):
@@ -25,6 +31,9 @@ async def send_msg(writer, obj):
 async def recv_msg(reader):
     header = await reader.readexactly(_LEN.size)
     (length,) = _LEN.unpack(header)
+    if length > MAX_MSG:
+        # Check BEFORE readexactly, so we never allocate the claimed size (P3).
+        raise MessageTooLarge("message of %d bytes exceeds MAX_MSG" % length)
     body = await reader.readexactly(length)
     return json.loads(body.decode("utf-8"))
 
@@ -52,7 +61,7 @@ class _PlayerConn:
         self.linux_user = linux_user
         self.reader = reader
         self.writer = writer
-        self.inbox = asyncio.Queue()
+        self.inbox = asyncio.Queue(maxsize=INBOX_MAX)   # bounded: backpressure (P4)
         self.connected = True
 
 
@@ -130,18 +139,31 @@ class CommServer:
         self._next_id += 1
         conn = _PlayerConn(pid, name, linux_user, reader, writer)
         self._players[pid] = conn
-        await send_msg(writer, {"type": "welcome", "player_id": pid,
-                                "name": name, "linux_user": linux_user})
-        print("[comm] %d joined: %s (%s)" % (pid, name, linux_user))
-        self._join_event.set()
 
+        # Everything after registration runs under one try/finally so that a
+        # drop at ANY point (even during the welcome send) is handled cleanly
+        # instead of throwing an unhandled exception (P2).
         try:
+            await send_msg(writer, {"type": "welcome", "player_id": pid,
+                                    "name": name, "linux_user": linux_user})
+            print("[comm] %d joined: %s (%s)" % (pid, name, linux_user))
+            self._join_event.set()
             while True:
-                await conn.inbox.put(await recv_msg(reader))
-        except (asyncio.IncompleteReadError, ConnectionError, OSError):
-            pass
+                msg = await recv_msg(reader)
+                await conn.inbox.put(msg)   # waits while the inbox is full: backpressure (P4)
+        except (asyncio.IncompleteReadError, ConnectionError, OSError, ValueError):
+            pass   # EOF, reset, oversized (MessageTooLarge), or bad JSON: treat as a disconnect
         finally:
             conn.connected = False
+            try:
+                writer.close()
+            except Exception:
+                pass
+            # Wake any recv() waiting on this player (P2). If the inbox is full,
+            # drop the oldest message to make room for the wake-up sentinel.
+            if conn.inbox.full():
+                conn.inbox.get_nowait()
+            conn.inbox.put_nowait(None)
             print("[comm] %d (%s) left" % (pid, name))
 
     def player_ids(self):
@@ -172,10 +194,21 @@ class CommServer:
     async def broadcast(self, msg, exclude=()):
         await self.multicast([p for p in self._players if p not in exclude], msg)
 
+    def is_connected(self, pid):
+        conn = self._players.get(pid)
+        return bool(conn and conn.connected)
+
     async def recv(self, pid, timeout=None):
-        q = self._players[pid].inbox
-        return await (q.get() if timeout is None
-                      else asyncio.wait_for(q.get(), timeout))
+        """Next message from pid. Returns None on timeout, or once pid has
+        disconnected (a sentinel None is queued on disconnect, see _handle)."""
+        conn = self._players.get(pid)
+        if conn is None or (not conn.connected and conn.inbox.empty()):
+            return None
+        try:
+            return await (conn.inbox.get() if timeout is None
+                          else asyncio.wait_for(conn.inbox.get(), timeout))
+        except asyncio.TimeoutError:
+            return None
 
     async def request(self, pid, msg, timeout=None):
         await self.send(pid, msg)

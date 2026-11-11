@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# setup_users.sh -- create the Linux users for Clue-Linux and install the game
+# setup_users.sh -- create the Linux users for Clue-dOS and install the game
 # into a world-readable shared folder so every player can run it.
 #
 # Each player must be a SEPARATE Linux user (assignment requirement).
@@ -43,8 +43,10 @@ groupadd -f cluedo
 # Install the game where any user can read and run it.
 mkdir -p "$SHARE"
 cp "$HERE"/*.py "$SHARE"/
+cp "$HERE"/*.sh "$SHARE"/
 chmod 755 "$SHARE"
 chmod 644 "$SHARE"/*.py
+chmod 755 "$SHARE"/*.sh
 echo "Installed game to $SHARE"
 
 for i in $(seq 1 "$N"); do
