@@ -75,16 +75,19 @@ moderator.
 **cgroup isolation (per player).** Instead of a plain `sudo -u`, launch each
 player inside a systemd transient cgroup with CPU, memory, and task limits:
 ```bash
-sudo ./launch_isolated.sh 1 Alice      # MemoryMax=128M TasksMax=20 CPUQuota=20%
-# override: MEM=64M TASKS=10 CPU=10% sudo ./launch_isolated.sh 1 Alice
+sudo ./launch_isolated.sh 1 Alice      # MemoryMax=128M MemorySwapMax=0 TasksMax=20 CPUQuota=20%
+# override: MEM=64M SWAP=0 TASKS=10 CPU=10% sudo ./launch_isolated.sh 1 Alice
 ```
-Confirm the limits applied (second terminal):
+Confirm the limits applied (second terminal, while the player is running):
 ```bash
 systemctl show cluedo-p1 -p MemoryMax -p TasksMax -p CPUQuotaPerSecUSec
-systemd-cgtop -n 1
+systemd-cgtop
 ```
 A fork bomb, memory hog, or CPU burn inside a player's own process is then
 capped to that player's cgroup and cannot take down the VM or the game.
+`MemorySwapMax=0` matters on a VM with swap: `MemoryMax` alone limits RAM but
+lets the overflow go to swap, so a memory hog is killed at the limit only when
+swap is also bounded.
 
 **Library/moderator robustness.** The library now caps message size
 (`MAX_MSG`), bounds each player's inbox (`INBOX_MAX`, backpressure), and wakes a
@@ -100,10 +103,16 @@ python3 attacks.py silent     # join then never answer  -> turn is skipped
 python3 attacks.py quit       # join then disconnect     -> player dropped
 python3 attacks.py oversize   # 4 GB length prefix        -> rejected, memory flat
 python3 attacks.py flood      # 100k messages             -> bounded inbox, memory flat
-# cgroup tests (run the attacker through the launcher, on the VM)
-sudo ./launch_isolated.sh 1 Mallory   # then inside: run attacks.py fork / mem / cpu
+# cgroup tests (on the VM): run the attacker in its own limited cgroup
+sudo systemd-run --collect --unit=cluedo-atk --uid=player1 \
+    -p MemoryMax=64M -p MemorySwapMax=0 -p TasksMax=20 -p CPUQuota=20% \
+    python3 /opt/clue-dos/attacks.py fork      # or mem / cpu
+# watch it, then stop it:
+systemd-cgtop                                  # cluedo-atk holds at its limits
+sudo systemctl kill -s KILL cluedo-atk; sudo systemctl reset-failed cluedo-atk
 ```
-Use `--ask-timeout 2` on the moderator to see the timeouts quickly.
+Expect: `fork` stops at TasksMax, `mem` is killed at MemoryMax, `cpu` is held to
+the CPU quota. Use `--ask-timeout 2` on the moderator to see the timeouts quickly.
 
 ## How to play
 
